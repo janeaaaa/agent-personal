@@ -43,6 +43,13 @@ AgenticRAGOCR/versions/
 AgenticRAGOCR/quarantine/
 versions/
 quarantine/
+backup_*/
+data/
+chroma_db/
+uploads/
+*.sqlite3
+*.db
+progress.json
 
 # Test files
 test_*.py

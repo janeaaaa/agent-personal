@@ -134,8 +134,11 @@ class RAGService:
 
             for ocr_result in ocr_results:
                 page_index = ocr_result.page_index
-
-                for block in ocr_result.blocks:
+                
+                # --- 优化 D: 块合并逻辑 (Block Merging) ---
+                merged_blocks = self._merge_blocks_spatial(ocr_result.blocks)
+                
+                for block in merged_blocks:
                     stats.total_blocks += 1
 
                     # 统计块类型
@@ -149,6 +152,10 @@ class RAGService:
                     elif block_type == "formula":
                         stats.formula_blocks += 1
 
+                    # --- 优化 C: 向量化规则优化 - 上下文路径注入 ---
+                    # 生成上下文前缀，增强语义指向性
+                    context_prefix = f"[文档:{file_name} | 第{page_index+1}页 | 类型:{block_type}] "
+                    
                     # 准备块的元数据
                     base_metadata = {
                         "doc_id": doc_id,
@@ -158,7 +165,8 @@ class RAGService:
                         "block_type": block_type,
                         "block_label": block.block_label,
                         "block_bbox": json.dumps(block.block_bbox),
-                        "block_order": block.block_order if block.block_order is not None else 0
+                        "block_order": block.block_order if block.block_order is not None else 0,
+                        "full_block_content": block.block_content # 保存完整内容用于召回
                     }
 
                     content = block.block_content.strip()
@@ -166,26 +174,43 @@ class RAGService:
                         continue
                     content = self._preprocess_for_index(content)
 
-                    # 对于长文本块，进行分块
-                    if block_type == "text" and len(content) > settings.chunk_size:
-                        chunks = self.text_splitter.split_text(content)
+                    # --- 优化 B: 分块逻辑优化 - 父子块逻辑 ---
+                    # 1. 设定阈值为 400 (用户要求)
+                    # 2. 设定重叠度为 10% (40 字符，恢复以提高准确性)
+                    sub_chunk_size = 400
+                    sub_chunk_overlap = 40
+                    
+                    if block_type == "text" and len(content) > sub_chunk_size:
+                        # 使用较小的细粒度分块
+                        child_splitter = RecursiveCharacterTextSplitter(
+                            chunk_size=sub_chunk_size,
+                            chunk_overlap=sub_chunk_overlap,
+                            separators=["\n\n", "\n", "。", "！", "？", "；", " ", ""]
+                        )
+                        chunks = child_splitter.split_text(content)
 
                         for i, chunk in enumerate(chunks):
                             metadata = base_metadata.copy()
                             metadata["chunk_index"] = i
                             metadata["total_chunks"] = len(chunks)
-                            metadata["is_chunked"] = True
-
-                            all_chunks.append(chunk)
+                            metadata["is_child"] = True
+                            
+                            # 将上下文前缀注入文本，增强向量语义
+                            enhanced_content = context_prefix + chunk
+                            
+                            all_chunks.append(enhanced_content)
                             all_metadatas.append(metadata)
                             all_ids.append(f"{doc_id}_p{page_index}_b{block.block_id}_c{i}")
                             chunk_id += 1
                     else:
-                        # 表格、图片、公式等不分块
+                        # 表格、图片、短文本等不进一步分块，作为独立单元
                         metadata = base_metadata.copy()
-                        metadata["is_chunked"] = False
-
-                        all_chunks.append(content)
+                        metadata["is_child"] = False
+                        
+                        # 同样注入上下文前缀
+                        enhanced_content = context_prefix + content
+                        
+                        all_chunks.append(enhanced_content)
                         all_metadatas.append(metadata)
                         all_ids.append(f"{doc_id}_p{page_index}_b{block.block_id}")
                         chunk_id += 1
@@ -229,6 +254,81 @@ class RAGService:
         s = re.sub(r"\n{3,}", "\n\n", s)
         s = re.sub(r"-\n", "", s)
         return s.strip()
+
+    def _merge_blocks_spatial(self, blocks: List[ParsedBlock]) -> List[ParsedBlock]:
+        """
+        基于“空间邻近性 + 结构启发式”的块合并增强逻辑
+        """
+        if not blocks:
+            return []
+
+        # 按 block_order 或 y 坐标排序
+        sorted_blocks = sorted(blocks, key=lambda b: (b.block_order if b.block_order is not None else 0, b.block_bbox[1]))
+        
+        merged = []
+        if not sorted_blocks:
+            return merged
+            
+        import copy
+        import re
+        current_block = copy.deepcopy(sorted_blocks[0])
+        
+        # 标点符号正则表达式：用于判断句子是否结束
+        sentence_ends = re.compile(r'[。！？.!?：:；;]$')
+        
+        for i in range(1, len(sorted_blocks)):
+            next_block = copy.deepcopy(sorted_blocks[i])
+            
+            # 只合并 text 类型
+            if current_block.block_label == "text" and next_block.block_label == "text":
+                curr_bbox = current_block.block_bbox
+                next_bbox = next_block.block_bbox
+                
+                # 1. 空间逻辑优化：动态计算行高
+                curr_height = max(1, curr_bbox[3] - curr_bbox[1])
+                # 如果当前块包含多行，取平均行高（简单估算）
+                line_count = max(1, len(current_block.block_content) // 40) # 假设每行约40字
+                avg_line_height = curr_height / line_count
+                
+                vertical_gap = next_bbox[1] - curr_bbox[3]
+                
+                # 计算水平重叠度
+                curr_x1, curr_x2 = curr_bbox[0], curr_bbox[2]
+                next_x1, next_x2 = next_bbox[0], next_bbox[2]
+                overlap_x1 = max(curr_x1, next_x1)
+                overlap_x2 = min(curr_x2, next_x2)
+                overlap_width = max(0, overlap_x2 - overlap_x1)
+                curr_width = max(1, curr_x2 - curr_x1)
+                x_alignment = overlap_width / curr_width
+                
+                # 2. 结构启发式：检查末尾标点
+                ends_with_punc = bool(sentence_ends.search(current_block.block_content.strip()))
+                
+                # 合并决策逻辑：
+                # 基础条件：水平对齐度高 (> 60%)
+                # 空间条件：垂直间距 < 1.5 倍平均行高
+                # 结构启发：如果末尾没有标点，且垂直间距在合理范围内 (如 3 倍行高)，也强制合并
+                is_spatial_near = 0 <= vertical_gap < (avg_line_height * 1.5)
+                is_structural_linked = not ends_with_punc and (0 <= vertical_gap < (avg_line_height * 3.0))
+                
+                if x_alignment > 0.6 and (is_spatial_near or is_structural_linked):
+                    # 执行合并
+                    connector = "" if not current_block.block_content.endswith("-") else ""
+                    current_block.block_content += connector + " " + next_block.block_content
+                    # 更新 bbox
+                    current_block.block_bbox = [
+                        min(curr_bbox[0], next_bbox[0]),
+                        min(curr_bbox[1], next_bbox[1]),
+                        max(curr_bbox[2], next_bbox[2]),
+                        max(curr_bbox[3], next_bbox[3])
+                    ]
+                    continue
+            
+            merged.append(current_block)
+            current_block = next_block
+            
+        merged.append(current_block)
+        return merged
 
     async def query(
         self,
@@ -288,9 +388,16 @@ class RAGService:
             retrieved_results = []
             if results and results["documents"]:
                 for i in range(len(results["documents"][0])):
+                    metadata = results["metadatas"][0][i]
+                    
+                    # --- 优化召回逻辑: 如果是子块，优先提供完整的父块内容给 LLM ---
+                    content = results["documents"][0][i]
+                    if metadata.get("is_child") and metadata.get("full_block_content"):
+                        content = metadata.get("full_block_content")
+                    
                     result_item = {
-                        "content": results["documents"][0][i],
-                        "metadata": results["metadatas"][0][i],
+                        "content": content,
+                        "metadata": metadata,
                         "score": 1 - results["distances"][0][i],  # 距离转相似度
                     }
                     retrieved_results.append(result_item)

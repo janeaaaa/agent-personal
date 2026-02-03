@@ -95,21 +95,21 @@ class LLMService:
             for citation in citations:
                 citation_map[citation.id] = f"【{citation.id}】"
 
-            # 构建 prompt (采用原始版本的简洁 Prompt)
-            system_prompt = """你是一个专业的文档问答助手。你的任务是：
-1. 基于提供的文档上下文，准确回答用户的问题
-2. 在回答中使用【数字】标记引用来源（例如【1】【2】）
-3. 对于表格、图像、公式等特殊内容，明确指出其类型
-4. 如果上下文中没有相关信息，诚实地说明
-5. 回答要准确、简洁、结构清晰
+            # 构建 prompt (增强约束：严禁发散，引用优先)
+            system_prompt = """你是一个极其严谨的文档问答助手。你的任务是基于提供的文档上下文，提供事实性的回答。
+
+必须遵守的铁律：
+1. **严禁发散与猜测**：如果文档中没有明确提到的数字、日期、结论或任何事实，严禁根据常识、预训练知识或逻辑推导进行猜测。如果信息不足，请直接回答“文档中未提及此信息”。
+2. **引用优先**：你的每一个核心观点、事实、数据，都必须在句尾紧跟对应的引用编号（例如【1】【2】）。严禁提供任何无法溯源到上下文的断言。
+3. **忠实原意**：不要试图美化或改变文档的原意。对于表格、图像、公式等内容，请明确指出其所在的页码和类型。
+4. **简洁准确**：回答应结构清晰，避免冗长的废话。
 
 引用标注规则：
-- 使用【1】【2】【3】等数字标记，对应检索到的文档块
-- 每个关键信息点都应该标注引用来源
-- 多个来源可以连续标注，如【1】【2】
+- 使用【1】【2】【3】等数字标记，对应下方“文档上下文”中的顺序。
+- 多个来源请连续标注，如【1】【2】。
 """
 
-            user_prompt = f"""基于以下文档上下文，回答用户的问题。
+            user_prompt = f"""请严格基于以下“文档上下文”回答用户问题。如果上下文无法支持回答，请直接告知。
 
 ## 文档上下文
 {context}
@@ -117,7 +117,7 @@ class LLMService:
 ## 用户问题
 {query}
 
-请提供详细的回答，并在关键信息处标注引用来源【1】【2】等。
+请提供准确的回答，并确保每个事实点都有引用标注：
 """
 
             # 调用 Qwen 模型 (采用原始版本的 Generation.call 方式)
@@ -170,7 +170,7 @@ class LLMService:
                 model=settings.qwen_model_name,
                 messages=messages,
                 result_format='message',
-                temperature=settings.temperature,
+                temperature=0.01, # 极低温度，确保输出高度确定，不发散
                 top_p=settings.top_p,
                 max_tokens=settings.max_tokens,
                 stream=True,
@@ -181,7 +181,7 @@ class LLMService:
                 model=settings.qwen_model_name,
                 messages=messages,
                 result_format='message',
-                temperature=settings.temperature,
+                temperature=0.01, # 极低温度
                 top_p=settings.top_p,
                 max_tokens=settings.max_tokens,
             )
