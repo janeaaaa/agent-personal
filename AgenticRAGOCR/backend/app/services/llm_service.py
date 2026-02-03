@@ -70,7 +70,21 @@ class LLMService:
         try:
             # 构建上下文
             context_parts = []
+            
+            # 优先提取全局总结
+            global_summary = ""
+            for chunk in context_chunks:
+                if chunk["metadata"].get("is_summary"):
+                    global_summary = chunk["content"]
+                    break
+            
+            if global_summary:
+                context_parts.append(f"【文档全局背景】\n{global_summary}")
+
             for i, chunk in enumerate(context_chunks):
+                if chunk["metadata"].get("is_summary"):
+                    continue # 已经添加过了
+                
                 metadata = chunk["metadata"]
                 content = chunk["content"]
                 block_type = metadata.get("block_type", "text")
@@ -275,3 +289,38 @@ class LLMService:
         """清理资源"""
         self._initialized = False
         logger.info("LLM service cleaned up")
+
+    async def generate_summary(self, text: str, max_chars: int = 500) -> str:
+        """
+        为文本生成摘要 (用于增强 RAG 全局语义)
+        """
+        if not self._initialized:
+            await self.initialize()
+
+        if not text or len(text) < 100:
+            return text
+
+        try:
+            system_prompt = f"你是一个专业的文档摘要助手。请用一两句话概括以下内容的重点，字数控制在 {max_chars} 字以内。要求简洁、准确，保留核心语义。"
+            user_prompt = f"请概括以下内容：\n\n{text[:10000]}" # 限制输入长度，防止 token 溢出
+
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(
+                None,
+                self._call_qwen_sync,
+                system_prompt,
+                user_prompt,
+                False
+            )
+
+            summary = ''
+            if hasattr(response, 'output'):
+                if hasattr(response.output, 'choices') and len(response.output.choices) > 0:
+                    summary = response.output.choices[0].message.content
+                elif hasattr(response.output, 'text'):
+                    summary = response.output.text
+            
+            return summary.strip() or text[:max_chars]
+        except Exception as e:
+            logger.error(f"Error generating summary: {e}")
+            return text[:max_chars]

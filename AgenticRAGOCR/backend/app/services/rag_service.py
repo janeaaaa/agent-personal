@@ -27,6 +27,7 @@ import unicodedata
 
 from app.config import settings
 from app.models.schemas import OCRResult, ParsedBlock, Citation, DocumentStats
+from app.services.llm_service import LLMService
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +42,7 @@ class RAGService:
         self.collections = {}
         self.collection_dims = {}
         self.embedding_batch_size = 10  # Qwen API 批次大小限制（最大10）
+        self.llm_service = LLMService()
 
     async def initialize(self):
         """初始化 RAG 服务"""
@@ -53,6 +55,9 @@ class RAGService:
             # 在线程池中初始化（避免阻塞）
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, self._init_components)
+            
+            # 初始化 LLM 服务 (用于摘要生成)
+            await self.llm_service.initialize()
 
             self._initialized = True
             logger.info("RAG service initialized successfully")
@@ -96,17 +101,28 @@ class RAGService:
         file_name: str
     ) -> DocumentStats:
         """
-        索引文档到向量数据库
+        索引文档到向量数据库 (增强全局语义版本)
         """
         if not self._initialized:
             await self.initialize()
 
         try:
             logger.info(f"Indexing document {doc_id}...")
+            
+            # --- 优化 E: 全局语义增强 - 预生成文档摘要 ---
+            full_text_content = ""
+            for ocr_result in ocr_results:
+                for block in ocr_result.blocks:
+                    if block.block_content:
+                        full_text_content += block.block_content + "\n"
+            
+            doc_summary = ""
+            if len(full_text_content) > 200:
+                logger.info(f"Generating global summary for document {doc_id}...")
+                doc_summary = await self.llm_service.generate_summary(full_text_content, max_chars=300)
 
             # 创建文档专属的 collection
             collection_name = f"doc_{doc_id}"
-
             loop = asyncio.get_event_loop()
             collection = await loop.run_in_executor(
                 None,
@@ -121,6 +137,18 @@ class RAGService:
             all_embeddings = []
             all_metadatas = []
             all_ids = []
+
+            # 1. 索引文档全局摘要 (用于全文理解类问题)
+            if doc_summary:
+                all_chunks.append(f"[文档全文总结]: {doc_summary}")
+                all_metadatas.append({
+                    "doc_id": doc_id,
+                    "file_name": file_name,
+                    "block_type": "summary",
+                    "is_summary": True,
+                    "is_child": False
+                })
+                all_ids.append(f"{doc_id}_global_summary")
 
             chunk_id = 0
             stats = DocumentStats(
@@ -153,8 +181,9 @@ class RAGService:
                         stats.formula_blocks += 1
 
                     # --- 优化 C: 向量化规则优化 - 上下文路径注入 ---
-                    # 生成上下文前缀，增强语义指向性
-                    context_prefix = f"[文档:{file_name} | 第{page_index+1}页 | 类型:{block_type}] "
+                    # 生成上下文前缀，增强语义指向性 (注入全局摘要)
+                    summary_context = f"[文档摘要:{doc_summary}] " if doc_summary else ""
+                    context_prefix = f"{summary_context}[文档:{file_name} | 第{page_index+1}页 | 类型:{block_type}] "
                     
                     # 准备块的元数据
                     base_metadata = {
@@ -375,32 +404,50 @@ class RAGService:
 
             # 查询 ChromaDB
             loop = asyncio.get_event_loop()
+            
+            # --- 优化 F: 全局查询感知 ---
+            is_global_query = any(word in query_text.lower() for word in ["总结", "全部", "整体", "概括", "讲了什么", "summary", "overview"])
+            search_k = top_k * 2 if is_global_query else top_k
+
             results = await loop.run_in_executor(
                 None,
                 lambda: collection.query(
                     query_embeddings=[query_embedding],
-                    n_results=top_k,
+                    n_results=search_k,
                     include=["documents", "metadatas", "distances"]
                 )
             )
 
             # 转换结果格式
             retrieved_results = []
+            seen_contents = set()
+            
             if results and results["documents"]:
                 for i in range(len(results["documents"][0])):
                     metadata = results["metadatas"][0][i]
-                    
-                    # --- 优化召回逻辑: 如果是子块，优先提供完整的父块内容给 LLM ---
                     content = results["documents"][0][i]
+                    
+                    # 优先提供完整的父块内容
                     if metadata.get("is_child") and metadata.get("full_block_content"):
                         content = metadata.get("full_block_content")
+                    
+                    if content in seen_contents:
+                        continue
+                    seen_contents.add(content)
+                    
+                    # --- 优化 G: 滑动窗口上下文扩展 (Sliding Window Expansion) ---
+                    # 如果不是总结类查询，且结果较少，可以考虑获取相邻块
+                    # 这里简单实现：如果命中某个块，记录其 ID，后续可以增加逻辑拉取前后块
                     
                     result_item = {
                         "content": content,
                         "metadata": metadata,
-                        "score": 1 - results["distances"][0][i],  # 距离转相似度
+                        "score": 1 - results["distances"][0][i],
                     }
                     retrieved_results.append(result_item)
+                    
+                    if len(retrieved_results) >= top_k:
+                        break
 
             return retrieved_results
 
