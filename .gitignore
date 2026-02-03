@@ -39,6 +39,20 @@ AgenticRAGOCR/backend/uploads/
 AgenticRAGOCR/backend/app/services/backup_20260202/
 AgenticRAGOCR/backend/multimodal_parser/*_parsed/
 AgenticRAGOCR/backend/multimodal_parser/*_result.json
+AgenticRAGOCR/versions/
+AgenticRAGOCR/quarantine/
+versions/
+quarantine/
+
+# Test files
+test_*.py
+inspect_*.py
+download_*.py
+temp_test/
+*.pdf
+*.png
+*.jpg
+*.jpeg
 
 # Logs
 *.log

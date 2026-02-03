@@ -123,10 +123,6 @@ class MultimodalDocParser:
             lambda: self.client.chat.completions.create(
                 model=self.model_name,
                 messages=messages,
-                extra_body={
-                    "enable_thinking": True,
-                    "thinking_budget": 2048
-                }
             )
         )
         

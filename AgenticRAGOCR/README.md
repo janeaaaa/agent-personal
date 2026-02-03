@@ -71,12 +71,18 @@
   - POST /api/query、POST /api/query/stream
 
 ## 配置与环境
-- 依赖（核心）：
-  - 后端：FastAPI、chromadb、dashscope、langchain、pysqlite3（或系统 sqlite3）
-  - 解析：paddleocr（可选）、PyPDF2、pdfminer.six、easyocr（图片识别）
-- 环境变量：
-  - 后端：DashScope API Key、ChromaDB 持久化目录、PaddleOCR 模型目录（可选）
-  - 前端：VITE_API_BASE_URL
+### 1. API 密钥配置 (关键)
+本项目使用阿里云百炼平台 (DashScope) 的模型能力。为了安全起见，**请勿将 API 密钥直接硬编码在代码中**。
+- **配置方法**：
+  1. 在 `AgenticRAGOCR/backend/` 目录下创建 `.env` 文件（可参考 `.env.example`）。
+  2. 在 `.env` 中添加：`DASHSCOPE_API_KEY=你的密钥`。
+  3. 也可以通过系统环境变量设置 `DASHSCOPE_API_KEY`。
+- **注意**：`.env` 文件已被包含在 `.gitignore` 中，不会被提交到仓库。每次 fork 或克隆项目后，请务必手动配置。
+
+### 2. 依赖项
+- **后端**：FastAPI、chromadb、dashscope、langchain、pysqlite3
+- **解析**：paddleocr（可选）、PyPDF2、pdfminer.six、easyocr
+- **前端**：React、Vite、Tailwind CSS
 
 ## 测试与评估（建议）
 - 集成测试：上传→解析→进度→块→检索→问答 全链路脚本
