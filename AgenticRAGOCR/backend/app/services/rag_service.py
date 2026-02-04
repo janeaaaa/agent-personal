@@ -166,7 +166,7 @@ class RAGService:
                 # --- 优化 D: 块合并逻辑 (Block Merging) ---
                 merged_blocks = self._merge_blocks_spatial(ocr_result.blocks)
                 
-                for block in merged_blocks:
+                for block_idx, block in enumerate(merged_blocks):
                     stats.total_blocks += 1
 
                     # 统计块类型
@@ -191,6 +191,7 @@ class RAGService:
                         "file_name": file_name,
                         "page_index": page_index,
                         "block_id": block.block_id,
+                        "seq_index": block_idx, # 新增：页内顺序索引，用于空间扩展
                         "block_type": block_type,
                         "block_label": block.block_label,
                         "block_bbox": json.dumps(block.block_bbox),
@@ -229,7 +230,7 @@ class RAGService:
                             
                             all_chunks.append(enhanced_content)
                             all_metadatas.append(metadata)
-                            all_ids.append(f"{doc_id}_p{page_index}_b{block.block_id}_c{i}")
+                            all_ids.append(f"{doc_id}_p{page_index}_s{block_idx}_c{i}")
                             chunk_id += 1
                     else:
                         # 表格、图片、短文本等不进一步分块，作为独立单元
@@ -241,7 +242,7 @@ class RAGService:
                         
                         all_chunks.append(enhanced_content)
                         all_metadatas.append(metadata)
-                        all_ids.append(f"{doc_id}_p{page_index}_b{block.block_id}")
+                        all_ids.append(f"{doc_id}_p{page_index}_s{block_idx}")
                         chunk_id += 1
 
             # 批量生成 embeddings
@@ -436,11 +437,11 @@ class RAGService:
                     seen_contents.add(content)
                     
                     # --- 优化 G: 滑动窗口上下文扩展 (Sliding Window Expansion) ---
-                    # 如果不是总结类查询，且结果较少，可以考虑获取相邻块
-                    # 这里简单实现：如果命中某个块，记录其 ID，后续可以增加逻辑拉取前后块
+                    # 增强空间临近性：获取命中块的前后相邻块
+                    expanded_content = await self._expand_context_spatially(collection, doc_id, metadata, content)
                     
                     result_item = {
-                        "content": content,
+                        "content": expanded_content,
                         "metadata": metadata,
                         "score": 1 - results["distances"][0][i],
                     }
@@ -454,6 +455,78 @@ class RAGService:
         except Exception as e:
             logger.error(f"Error querying document {doc_id}: {e}")
             raise
+
+    async def _expand_context_spatially(
+        self, 
+        collection, 
+        doc_id: str, 
+        metadata: Dict[str, Any], 
+        original_content: str
+    ) -> str:
+        """
+        空间上下文扩展：获取当前块在同一页内的前后相邻块
+        """
+        # 如果是总结块或子块，暂不进行空间扩展（子块已包含父块完整内容）
+        if metadata.get("is_summary") or metadata.get("is_child"):
+            return original_content
+
+        page_index = metadata.get("page_index")
+         seq_index = metadata.get("seq_index")
+         
+         if page_index is None or seq_index is None:
+             return original_content
+ 
+         # 构造前后相邻块的 ID (使用 seq_index 保证顺序连续性)
+         prev_id = f"{doc_id}_p{page_index}_s{seq_index-1}"
+         next_id = f"{doc_id}_p{page_index}_s{seq_index+1}"
+        
+        try:
+            loop = asyncio.get_event_loop()
+            
+            # 使用 metadata 过滤来获取相邻块，这样可以兼容子块逻辑
+            neighbor_results = await loop.run_in_executor(
+                None,
+                lambda: collection.get(
+                    where={
+                        "$and": [
+                            {"page_index": page_index},
+                            {"seq_index": {"$in": [seq_index - 1, seq_index + 1]}}
+                        ]
+                    },
+                    include=["documents", "metadatas"]
+                )
+            )
+            
+            if not neighbor_results or not neighbor_results["documents"]:
+                return original_content
+                
+            # 整理结果，确保每个 seq_index 只取一份完整内容（去重）
+            neighbor_map = {} # seq_index -> content
+            for i, meta in enumerate(neighbor_results["metadatas"]):
+                s_idx = meta.get("seq_index")
+                # 优先使用 full_block_content
+                content = meta.get("full_block_content") or neighbor_results["documents"][i]
+                if s_idx not in neighbor_map:
+                    neighbor_map[s_idx] = content
+                
+            expanded_text = ""
+            if (seq_index - 1) in neighbor_map:
+                prev_content = neighbor_map[seq_index - 1]
+                if len(prev_content) > 5:
+                    expanded_text += f"[前文内容]: {prev_content}\n\n"
+            
+            expanded_text += f"[当前命中的核心内容]:\n{original_content}"
+            
+            if (seq_index + 1) in neighbor_map:
+                next_content = neighbor_map[seq_index + 1]
+                if len(next_content) > 5:
+                    expanded_text += f"\n\n[后文内容]: {next_content}"
+                    
+            return expanded_text.strip()
+            
+        except Exception as e:
+            logger.warning(f"Error expanding spatial context: {e}")
+            return original_content
 
     def _get_or_create_collection(self, collection_name: str):
         """获取或创建 collection"""

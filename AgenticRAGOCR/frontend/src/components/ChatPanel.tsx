@@ -9,7 +9,7 @@ import { queryDocument } from '@/lib/api';
 import { useDocument } from '@/contexts/DocumentContext';
 import { useToast } from '@/hooks/use-toast';
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8100';
 
 interface Message {
   content: string;
